@@ -4,6 +4,8 @@
 
 本报告深入分析 MiniMax-M2 系列模型在 vLLM 中的实现，从计算效率、内存优化、调度策略等多个维度识别潜在的性能优化机会。
 
+**重要修正**：MiniMax-M2 使用的是 **GQA (Grouped Query Attention)** + **MoE (Mixture of Experts)** 架构，而非 MLA。
+
 ---
 
 ## 一、MiniMax-M2 架构特点分析
@@ -13,22 +15,43 @@
 | 组件 | 文件位置 | 功能描述 |
 |------|----------|----------|
 | **模型实现** | [`minimax_m2.py`](file:///workspace/vllm/model_executor/models/minimax_m2.py) | M2 模型主体实现 |
-| **MLA 注意力** | [`mla_attention.py`](file:///workspace/vllm/model_executor/layers/attention/mla_attention.py) | Multi-head Latent Attention 实现 |
+| **GQA 注意力** | [`attention.py`](file:///workspace/vllm/model_executor/layers/attention.py) | Grouped Query Attention 实现 |
+| **MoE 混合专家** | [`fused_moe.py`](file:///workspace/vllm/model_executor/layers/fused_moe.py) | 混合专家实现 |
 | **推理解析器** | [`minimax_m2_reasoning_parser.py`](file:///workspace/vllm/parser/minimax_m2_parser.py) | 推理过程解析 |
 | **工具调用解析** | [`minimax_m2_tool_parser.py`](file:///workspace/vllm/tool_parsers/minimax_m2_tool_parser.py) | Tool Call 解析 |
 
-### 1.2 MLA (Multi-head Latent Attention) 核心参数
+### 1.2 关键架构参数
 
 ```python
-# 从 mla_attention.py 注释中提取的参数定义
-Lq          # latent dimension for Q              (M2 配置)
-Lkv         # latent dimension for K/V          (M2 配置)
-P           # nope dimension, no rope            = 128 (DS V3 默认)
-R           # rope dimension, goes through rope  = 64  (DS V3 默认)
-V           # V head dim                        = 128 (DS V3 默认)
+# MiniMax-M2 注意力层关键参数
+class MiniMaxM2Attention(nn.Module):
+    hidden_size           # 隐藏层维度
+    num_heads             # Q 头数 (总头数)
+    num_kv_heads          # KV 头数 (GQA 分组数)
+    head_dim              # 每个头的维度
+    rotary_dim            # RoPE 旋转维度
+    rms_norm_eps          # RMSNorm epsilon
 ```
 
-### 1.3 M2 推理模式特点
+### 1.3 GQA 机制说明
+
+GQA 相比标准 MHA 的优势：
+- **减少 KV Cache 内存**：通过共享 KV 头
+- **降低计算量**：更少的 KV 投影和存储
+- **保持精度**：在减少资源的同时保持模型质量
+
+### 1.4 MoE 机制说明
+
+```python
+class MiniMaxM2MoE(nn.Module):
+    num_local_experts     # 本地专家数
+    num_experts_per_tok   # 每个 token 激活的专家数 (Top-K)
+    gate                  # 门控网络
+    experts               # FusedMoE 专家层
+    use_routing_bias      # 是否使用路由偏置
+```
+
+### 1.5 M2 推理模式特点
 
 MiniMax-M2 模型的推理过程有独特之处：
 
@@ -46,117 +69,100 @@ end_token = "</think>"     # 结束标记
 
 ### 2.1 ⚡ 高优先级优化
 
-#### 2.1.1 **MLA 矩阵运算融合**
+#### 2.1.1 **GQA KV 投影融合优化**
 
 **现状分析**：
 ```python
-# 当前实现中存在多次独立的矩阵运算
-q_c      = h_t @ W_DQ        # 步骤 1
-q_nope   = (q_c @ W_UQ).view(Sq, N, P)  # 步骤 2
-q_pe     = RoPE(q_c @ W_QR)              # 步骤 3
-new_kv_c = h_t @ W_DKV                    # 步骤 4
+# minimax_m2.py 第 245-246 行
+qkv, _ = self.qkv_proj(hidden_states)
+q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 ```
 
-**优化建议**：将 Q 压缩和 K/V 压缩合并为单次矩阵运算
+虽然已经是 `QKVParallelLinear`，但可以进一步优化：
+
+**优化建议**：
+1. **检查是否可以利用 FP8 量化**：当前代码有 FP8 相关的 remap 逻辑（第 463-471 行）
+2. **GQA 专用 Kernel**：针对 `num_kv_heads < num_heads` 的情况优化
 
 ```python
-# 优化后的融合实现
-# 将 W_DQ、W_DKV 拼接为 [H, Lq + Lkv] 的单个矩阵
-combined_proj = torch.cat([W_DQ, W_DKV], dim=-1)
-combined_result = h_t @ combined_proj
-q_c, new_kv_c = torch.split(combined_result, [Lq, Lkv], dim=-1)
+# 优化思路
+if num_kv_heads < num_heads:
+    # 使用 GQA 专用的 fused kernel
+    # 减少不必要的 KV 复制
+    pass
 ```
 
-**预期收益**：
-- 减少内存带宽使用 ~30%
-- 降低 GPU kernel 启动开销
+#### 2.1.2 **QK RMSNorm 融合**
 
-#### 2.1.2 **RoPE 位置编码计算优化**
+**现状分析**（第 247 行）：
+```python
+q, k = MiniMaxText01RMSNormTP.forward_qk(self.q_norm, self.k_norm, q, k)
+```
+
+这是 M2 的特殊设计，对 Q 和 K 单独做 RMSNorm。
+
+**优化建议**：
+1. **检查是否可以和 RoPE 融合**：RoPE 紧跟在 RMSNorm 之后（第 248 行）
+2. **使用专门的 `minimax_reduce_rms_kernel`**：代码库中有相关的 CUDA Kernel（第 85-87 行的 csrc）
+
+#### 2.1.3 **MoE 门控与专家计算融合**
 
 **现状分析**：
 ```python
-# 每个 token 都执行 RoPE
-q_pe     = RoPE(q_c @ W_QR)        # Decode 阶段
-new_k_pe = RoPE(h_t @ W_KR)        # 新 token 计算
+# minimax_m2.py 第 320 行
+hidden_states = self.block_sparse_moe(hidden_states)
+
+# 门控和专家是分离的步骤
+router_logits, _ = self.gate(hidden_states.to(torch.float32))  # 第 135 行
+final_hidden_states = self.experts(...)  # 第 136-138 行
 ```
 
 **优化建议**：
-1. **预计算旋转角度**：提前计算 `exp(i * θ)` 常量
-2. **使用向量化的复数乘法**：替代逐元素计算
-3. **针对 M2 的 rope_nope_assist 特性**：检查是否有融合路径
+1. **门控网络与 Top-K 选择融合**：减少 kernel 启动
+2. **专家计算并行优化**：利用 FusedMoE 已有的优化，但可进一步针对 M2 配置调优
 
-```python
-# 预计算优化
-COS_SIN_TABLE = precompute_rope_tables(head_dim=R, max_seq_len=MAX_SEQ)
-# 或者使用 FlashInfer 的融合 kernel
-```
-
-#### 2.1.3 **FlashInfer MLA Kernel 深度优化**
+#### 2.1.4 **FlashAttention 优化**
 
 **现状分析**：
 ```python
-# flashinfer_mla.py 中的 decode 实现
-o = trtllm_batch_decode_with_kv_cache_mla(
-    query=q,
-    kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
+# 使用标准 Attention 类，底层应该使用 FlashAttention
+self.attn = Attention(
+    self.num_heads,
+    self.head_dim,
+    self.scaling,
+    num_kv_heads=self.num_kv_heads,
     ...
 )
 ```
 
-**当前限制**：
-```python
-# 限制：qk_nope_head_dim 必须在 [64, 128, 192] 中
-if qk_nope_head_dim not in [64, 128, 192]:
-    return "FlashInfer MLA kernel requires qk_nope_head_dim in [64, 128, 192]"
-```
-
 **优化建议**：
-1. 扩展 FlashInfer 支持更多的 qk_nope_head_dim 值
-2. 针对 M2 特定配置申请专门的优化 kernel
-3. 启用 `use_fp8=True` 的量化路径
+1. **确认 FlashAttention 版本**：检查是否使用最新的 FlashAttention 3/4
+2. **GQA 专用路径**：确保 Attention 类对 GQA 有专门的优化路径
 
 ---
 
 ### 2.2 🔧 中优先级优化
 
-#### 2.2.1 **Prefill 阶段 Chunking 策略优化**
+#### 2.2.1 **Prefill 阶段优化**
 
 **现状分析**：
-```python
-# mla_attention.py 中的 chunked prefill 逻辑
-for chunk_idx in range(cdiv(C, MCC)):
-    chunk_start  = chunk_idx * MCC
-    chunk_end    = min(chunk_start + MCC, C)
-    # ... 对每个 chunk 执行独立的 attention 计算
-```
-
-**问题**：
-- 每个 chunk 都需要完整的 softmax LSE (Log-Sum-Exp) 归并
-- `merge_attn_states` 操作有额外开销
+- 当前使用标准的 chunked prefill
+- GQA 在 Prefill 阶段也可以优化
 
 **优化建议**：
-1. 动态调整 MCC (Max Chunk Count)：
-   ```python
-   # 根据可用显存动态选择
-   MCC = min(available_memory / (N * P * sizeof(float32)), C)
-   ```
+1. **动态批处理**：根据序列长度动态调整 batch
+2. **KV Cache 预分配**：提前计算所需的 KV Cache 大小
 
-2. 减少 chunk 数量策略：
-   - 长序列优先使用更大的 MCC
-   - 利用 prefix caching 跳过已有计算
+#### 2.2.2 **RoPE 计算优化**
 
-#### 2.2.2 **KV Cache 压缩率提升**
-
-**现状分析**：
+**现状分析**（第 248 行）：
 ```python
-# v_head_dim 通常远小于 kv_lora_rank
-# 例如: v_head_dim = 128, kv_lora_rank = 512
+q, k = self.rotary_emb(positions, q, k)
 ```
 
 **优化建议**：
-1. **自适应压缩率**：根据序列长度动态调整压缩维度
-2. **分层压缩**：对重要 token (系统 prompt、few-shot) 使用更高压缩率
-3. **M2 专用配置**：申请 M2 模型的 kv_lora_rank 最优值
+1. **RoPE 表预计算**：确保旋转表是预计算的
+2. **融合 RoPE 与 QK Projection**：如果可能，将 RoPE 融合到前面的线性层
 
 ---
 
@@ -164,81 +170,45 @@ for chunk_idx in range(cdiv(C, MCC)):
 
 ### 3.1 ⚡ 高优先级优化
 
-#### 3.1.1 **KV Cache 布局优化**
+#### 3.1.1 **KV Cache 量化**
 
 **现状分析**：
-```python
-# tokenspeed_mla.py
-@classmethod
-def get_required_kv_cache_layout(cls) -> "KVCacheLayoutType | None":
-    return "HND"  # 目前强制使用 HND 布局
-```
-
-**HND vs ND F 布局对比**：
-| 布局 | 适用场景 | Decode 效率 | Prefill 效率 |
-|------|----------|-------------|--------------|
-| HND (当前) | 长序列 Decode | ⭐⭐⭐ | ⭐⭐ |
-| NHD | 长序列 Prefill | ⭐⭐ | ⭐⭐⭐ |
+- 代码中有 FP8 KV Cache 的支持（第 463-471 行的 remap 逻辑）
+- 但可能没有完全启用
 
 **优化建议**：
-1. **混合布局策略**：
-   ```python
-   if seq_len > THRESHOLD:
-       layout = "HND"  # Decode 优化
-   else:
-       layout = "NHD"  # Prefill 优化
-   ```
+1. **启用 FP8 KV Cache**：对于 M2 模型，FP8 应该可以保持精度
+2. **检查 KV Cache 布局**：确保使用最优的布局（HND vs NHD）
 
-2. **请求级别的布局选择**：根据预估序列长度选择最优布局
+```python
+# 优化建议
+if model_config.model_type == "minimax_m2":
+    cache_config.kv_cache_dtype = "fp8_e4m3"  # 启用 FP8
+```
 
-#### 3.1.2 **MLA Decode 阶段的 Workspace 优化**
+#### 3.1.2 **MoE 专家权重内存优化**
 
 **现状分析**：
 ```python
-# tokenspeed_mla.py
-_WORKSPACE_SIZE_FORMULA = """
-num_sms * num_heads * MAX_Q_LEN * (kv_lora_rank + 1) * sizeof(float32)
-"""
-_TOOKENSPEED_MAX_Q_LEN = 8  # 目前固定为 8
+# MoE 需要存储 num_local_experts 套专家权重
+# 这是 M2 模型内存的主要消耗之一
 ```
-
-**问题**：
-- 固定的 MAX_Q_LEN 可能不是所有场景最优
-- Workspace 预分配可能导致内存碎片
 
 **优化建议**：
-```python
-# 动态 workspace 计算
-def _compute_optimal_workspace(
-    num_heads: int,
-    kv_lora_rank: int,
-    available_memory: int
-) -> int:
-    # 根据可用内存计算最优配置
-    max_q_len = min(8, available_memory // (num_heads * kv_lora_rank * 4))
-    return num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * 4
-```
+1. **专家权重量化**：对 MoE 专家使用 FP8/INT8 量化
+2. **专家稀疏化**：如果某些专家很少被使用，可以考虑动态加载
+3. **检查是否有 LoRA 支持**：代码中有 `SupportsLoRA`，可以利用 LoRA 减少内存
 
-#### 3.1.3 **量化路径增强**
+#### 3.1.3 **激活内存优化**
 
 **现状分析**：
-```python
-# tokenspeed_mla.py
-supported_kv_cache_dtypes = ["fp8", "fp8_e4m3"]
+- MoE 的中间激活会占用大量内存
+- 特别是在大 batch 时
 
-# flashinfer_mla.py
-supported_kv_cache_dtypes = ["auto", "float16", "bfloat16", "fp8", "fp8_e4m3"]
-```
-
-**M2 优化建议**：
-1. **支持 FP8 E5M2 格式**：更高动态范围，减少精度损失
-2. **Int4 KV Cache**：研究 M2 模型对 Int4 量化的敏感性
-3. **混合精度策略**：
-   ```python
-   # 对 K 使用 FP8，对 V 使用 BF16
-   k_cache_dtype = "fp8_e4m3"
-   v_cache_dtype = "bfloat16"  # V head 需要更高精度
-   ```
+**优化建议**：
+1. **激活重计算**：在内存紧张时，牺牲计算换内存
+2. **梯度检查点**：如果是 fine-tuning 场景，但推理场景可能不需要
+3. **张量并行优化**：确保 TP 切分最优，特别是对于 MoE 专家
 
 ---
 
@@ -247,45 +217,22 @@ supported_kv_cache_dtypes = ["auto", "float16", "bfloat16", "fp8", "fp8_e4m3"]
 #### 3.2.1 **前缀缓存 (Prefix Caching) 增强**
 
 **现状分析**：
-```python
-# 当前 MLA 不直接支持 prefix caching 的 KV 复用
-# 需要额外的 KV 匹配逻辑
-```
+- M2 可能经常有重复的系统 prompt
+- Prefix Caching 可以复用 KV Cache
 
 **优化建议**：
-1. **KV Hash 缓存**：
-   ```python
-   def compute_kv_hash(kv_c: Tensor, kv_lora_rank: int) -> int:
-       # 使用低位 kv_c 计算快速 hash
-       hash_value = xorshift_hash(kv_c[:, :16])  # 只取前 16 维
-       return hash_value
-   ```
-
-2. **层级缓存策略**：
-   - L1: GPU 显存 (LRU)
-   - L2: 系统内存 (LRU)
-   - L3: NVMe/SSD (基于访问频率)
+1. **启用 Prefix Caching**：确保 Prefix Caching 功能开启
+2. **针对 M2 推理模式优化**：推理阶段的前缀也可以缓存
 
 #### 3.2.2 **内存分配器优化**
 
 **现状分析**：
-M2 的 MLA 使用 paged attention，每个 block 需要：
-- kv_c 缓存: `[block_size, kv_lora_rank]`
-- k_pe 缓存: `[block_size, rope_dim]`
+- MoE 需要频繁分配/释放不同形状的张量
+- 这可能导致内存碎片
 
 **优化建议**：
-```python
-# 使用专门的内存池
-class MLAMemoryPool:
-    def __init__(self, kv_lora_rank: int, rope_dim: int):
-        # 预分配连续内存区域
-        self.kv_c_pool = Pool(size=M*1024*1024, alignment=256)
-        self.k_pe_pool = Pool(size=M*1024*1024, alignment=256)
-    
-    def allocate(self, block_size: int) -> tuple[Tensor, Tensor]:
-        # 快速分配，无需 cudaMalloc
-        return self.kv_c_pool.alloc(block_size), self.k_pe_pool.alloc(block_size)
-```
+1. **使用内存池**：为常用形状预分配内存
+2. **异步内存回收**：延迟释放不再需要的内存
 
 ---
 
@@ -296,10 +243,8 @@ class MLAMemoryPool:
 #### 4.1.1 **Prefill/Decode Batch 混合调度**
 
 **现状分析**：
-```python
-# 当前的调度策略可能导致 Prefill 和 Decode 相互阻塞
-# M2 模型推理时间长，更需要精细的调度
-```
+- M2 模型推理时间长，更需要精细的调度
+- 当前调度器可能没有针对 GQA + MoE 优化
 
 **优化建议**：
 ```python
@@ -325,7 +270,19 @@ class MiniMaxM2Scheduler:
         return super()._should_preempt(request)
 ```
 
-#### 4.1.2 **推理长度感知调度**
+#### 4.1.2 **MoE 专家并行优化**
+
+**现状分析**：
+```python
+# 代码中有 get_tensor_model_parallel_world_size() 的使用
+# 但 MoE 专家并行可能还有优化空间
+```
+
+**优化建议**：
+1. **专家并行 (EP)**：检查是否支持 Expert Parallelism
+2. **TP + EP 混合**：对于超大规模 M2 模型，可以组合使用
+
+#### 4.1.3 **推理长度感知调度**
 
 **现状分析**：
 ```python
@@ -344,16 +301,16 @@ class MiniMaxM2Scheduler:
        max_reasoning = model_config.max_model_len - prompt_len
    ```
 
-2. **自适应 chunked prefill**：
+2. **自适应批处理**：
    ```python
-   def _compute_chunk_size(self, request: Request) -> int:
+   def _compute_batch_size(self, request: Request) -> int:
        budget = request.thinking_token_budget
        if budget and budget < 1024:
-           # 短推理：使用大 chunk 减少 kernel 开销
-           return min(budget, 256)
+           # 短推理：可以更大 batch
+           return 16
        else:
-           # 长推理：使用小 chunk 避免 OOM
-           return 64
+           # 长推理：较小 batch 避免 OOM
+           return 4
    ```
 
 ---
@@ -363,46 +320,21 @@ class MiniMaxM2Scheduler:
 #### 4.2.1 **CUDA Graph 兼容性提升**
 
 **现状分析**：
-```python
-# tokenspeed_mla.py
-_cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
-query_len_support = QueryLenSupport.UNIFORM
-```
-
-**问题**：
-- 只支持均匀 batch (所有请求 token 数相同)
-- 不支持非均匀 query 长度
+- 需要检查 GQA + MoE 的 CUDA Graph 支持情况
 
 **优化建议**：
-```python
-# 尝试支持 PIECEWISE 模式
-_cudagraph_support = AttentionCGSupport.PIECEWISE_BATCH
-
-# 或者使用 breakable CUDA graph
-@functools.lru_cache
-def _capture_with_padding(max_tokens: int):
-    # 捕获最大形状的 graph
-    # 实际运行时通过 padding 适配
-    pass
-```
+1. **启用 CUDA Graph**：对于 Decode 阶段，CUDA Graph 可以显著提升性能
+2. **针对 M2 配置调优**：确保捕获的 graph 最优
 
 #### 4.2.2 **推测解码 (Speculative Decoding) 支持**
 
 **现状分析**：
-M2 模型的推理过程较长，推测解码可能有显著收益。
+- M2 模型的推理过程较长，推测解码可能有显著收益
+- 代码中有 `SupportsEagle3`，表明支持 EAGLE 推测解码
 
 **优化建议**：
-```python
-class MiniMaxM2Speculator:
-    def __init__(self, draft_model, acceptance_threshold=0.8):
-        self.draft_model = draft_model
-        self.acceptance_threshold = acceptance_threshold
-    
-    def verify(self, target_tokens: Tensor, draft_tokens: Tensor) -> Tensor:
-        # M2 的验证逻辑
-        # 考虑推理标记的特殊性
-        pass
-```
+1. **启用 EAGLE3**：利用已有的 EAGLE3 支持
+2. **为 M2 训练专用 Draft 模型**：如果性能不够，可以训练专用的小模型
 
 ---
 
@@ -490,28 +422,21 @@ class StreamingToolParser:
 ### 6.1 FP8 量化增强
 
 **现状分析**：
-```python
-# ml_attention.py
-if is_quantized_kv_cache(self.kv_cache_dtype):
-    self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-    self.bmm2_scale *= layer._k_scale_float
-```
+- 代码中有 FP8 相关的支持（第 463-471 行的 remap）
+- 但可能需要针对 M2 调优
 
-**M2 优化建议**：
+**优化建议**：
 
-1. **M2 专用 FP8 量化 Kernel**：
+1. **对 M2 各部分分别量化**：
    ```python
-   # 申请 NVIDIA 提供 M2 的专用量化 kernel
-   class MiniMaxM2FP8Kernel:
-       @staticmethod
-       def quantize_mla_kv(
-           kv_c: Tensor,
-           kv_lora_rank: int,
-           v_head_dim: int
-       ) -> tuple[Tensor, Tensor]:
-           # 使用 M2 优化的量化参数
-           # 考虑 kv_lora_rank 和 v_head_dim 的比例
-           pass
+   # 建议的量化策略
+   if model_config.model_type == "minimax_m2":
+       # Q/K/V 投影
+       quant_config.qkv_quant = "fp8"
+       # MoE 专家
+       quant_config.moe_quant = "fp8"
+       # LM Head 可以保持 BF16
+       quant_config.lm_head_quant = "bf16"
    ```
 
 2. **动态精度切换**：
@@ -525,6 +450,13 @@ if is_quantized_kv_cache(self.kv_cache_dtype):
            return "bfloat16"
    ```
 
+### 6.2 INT8/INT4 量化探索
+
+**优化建议**：
+1. **INT8 权重量化**：对于 MoE 专家，可以尝试 INT8 量化
+2. **AWQ/GPTQ 量化**：检查是否支持这些先进的量化方法
+3. **混合精度**：对不同层使用不同的量化精度
+
 ---
 
 ## 七、综合优化路线图
@@ -533,84 +465,71 @@ if is_quantized_kv_cache(self.kv_cache_dtype):
 
 | 优化项 | 预期收益 | 风险 |
 |--------|----------|------|
-| FlashInfer Kernel 参数调优 | 5-10% | 低 |
-| RoPE 预计算 | 3-5% | 低 |
+| 启用 FP8 KV Cache | 15-25% 内存节省 | 低 |
+| 启用 EAGLE3 推测解码 | 20-40% 吞吐提升 | 低 |
 | 正则解析器优化 | 2-3% | 低 |
-| Workspace 动态计算 | 5-10% | 低 |
+| RoPE 与 RMSNorm 融合检查 | 3-5% | 低 |
 
 ### Phase 2: 中期优化 (1-2 月)
 
 | 优化项 | 预期收益 | 风险 |
 |--------|----------|------|
-| MLA 矩阵融合 | 10-15% | 中 |
-| 混合 KV Cache 布局 | 15-20% | 中 |
-| 推理长度感知调度 | 10-15% | 中 |
-| Prefix Caching 增强 | 20-30% | 中 |
+| MoE 专家 FP8 量化 | 20-30% 内存节省 | 中 |
+| 推理感知调度 | 10-15% | 中 |
+| Prefix Caching 增强 | 20-30% (对重复请求) | 中 |
+| GQA 专用 Kernel 调优 | 5-10% | 中 |
 
 ### Phase 3: 长期优化 (3-6 月)
 
 | 优化项 | 预期收益 | 风险 |
 |--------|----------|------|
-| M2 专用量化 Kernel | 15-25% | 高 |
-| 推测解码集成 | 30-50% | 高 |
-| 分布式 MLA | 50-100% | 高 |
+| Expert Parallelism 支持 | 取决于规模 | 高 |
+| 高级量化 (AWQ/GPTQ) | 30-50% 内存节省 | 高 |
+| M2 专用 CUDA Kernel | 15-25% | 高 |
+| 更激进的推测解码 | 50-100% | 高 |
 
 ---
 
 ## 八、具体代码修改建议
 
-### 8.1 FlashInfer MLA 参数优化
+### 8.1 启用 FP8 KV Cache
 
-**文件**: [`flashinfer_mla.py`](file:///workspace/vllm/v1/attention/backends/mla/flashinfer_mla.py)
+**文件**: 相关配置代码
 
 ```python
-# 建议修改
-@classmethod
-def supports_combination(cls, ...) -> str | None:
-    # 放宽 qk_nope_head_dim 限制
-    if qk_nope_head_dim not in [64, 128, 192]:
-        # 对于 M2 模型，可以尝试通用路径
-        if vllm_config.model_config.model_type == "minimax_m2":
-            logger.warning_once(
-                "Using fallback path for MiniMax-M2 MLA"
-            )
-            return None  # 不拒绝，使用 fallback
-    return None
+# 建议在模型配置或启动参数中默认启用
+if vllm_config.model_config.model_type == "minimax_m2":
+    if not vllm_config.cache_config.kv_cache_dtype:
+        vllm_config.cache_config.kv_cache_dtype = "fp8_e4m3"
+        logger.info("Auto-enabled FP8 KV Cache for MiniMax-M2")
 ```
 
-### 8.2 Workspace 动态计算
+### 8.2 检查并优化 MoE 计算
 
-**文件**: [`tokenspeed_mla.py`](file:///workspace/vllm/v1/attention/backends/mla/tokenspeed_mla.py)
+**文件**: [`minimax_m2.py`](file:///workspace/vllm/model_executor/models/minimax_m2.py)
 
 ```python
-# 建议修改
-def _get_workspace(
-    device: torch.device, 
-    num_heads: int, 
-    kv_lora_rank: int,
-    max_q_len: int | None = None  # 新增参数
-) -> torch.Tensor:
-    # 动态计算最优 workspace
-    effective_max_q = max_q_len or _TOKENSPEED_MAX_Q_LEN
-    
-    # 检查可用显存
-    free_memory = torch.cuda.get_device_properties(device).total_memory - \
-                  torch.cuda.memory_allocated(device)
-    
-    # 根据显存动态调整
-    if free_memory < needed:
-        # 减小 max_q_len
-        effective_max_q = min(effective_max_q, 4)
-    
-    needed = (
-        get_num_sm(device) * num_heads * effective_max_q * (kv_lora_rank + 1) * 4
-    )
-    # ... 后续逻辑
+# 检查当前的 FusedMoE 配置
+self.experts = FusedMoE(
+    num_experts=config.num_local_experts,
+    top_k=config.num_experts_per_tok,
+    scoring_func=config.scoring_func,
+    e_score_correction_bias=self.e_score_correction_bias,
+    hidden_size=config.hidden_size,
+    intermediate_size=config.intermediate_size,
+    renormalize=True,
+    quant_config=quant_config,
+    prefix=f"{prefix}.experts",
+    router_logits_dtype=torch.float32,
+)
+
+# 建议：检查是否可以启用更高级的 FusedMoE 特性
+# 例如：是否有针对 M2 配置的专用优化
 ```
 
 ### 8.3 调度器集成
 
-**文件**: 新建 `minimax_m2_scheduler.py`
+**文件**: 新建或修改调度器代码
 
 ```python
 class MiniMaxM2SchedulerPolicy:
@@ -658,7 +577,8 @@ class MiniMaxM2Benchmark:
         "latency_p50",
         "latency_p99",
         "memory_peak",
-        "kv_cache_hit_rate",
+        "kv_cache_usage",
+        "moe_expert_utilization",  # MoE 专家利用率
         "gpu_utilization",
     ]
 ```
@@ -676,6 +596,9 @@ python -m torch.profiler \
     --activities=cuda \
     --trace_file=trace.json \
     python your_script.py
+
+# 特别关注 MoE 相关的 kernel
+# 检查专家计算是否平衡
 ```
 
 ---
@@ -686,26 +609,28 @@ python -m torch.profiler \
 
 | 优化项 | 类别 | 优先级 | 预期收益 | 复杂度 |
 |--------|------|--------|----------|--------|
-| FlashInfer 参数调优 | 计算 | P0 | 5-10% | 低 |
-| RoPE 预计算 | 计算 | P0 | 3-5% | 低 |
-| 动态 Workspace | 内存 | P0 | 5-10% | 低 |
-| MLA 矩阵融合 | 计算 | P1 | 10-15% | 中 |
-| 混合 KV 布局 | 内存 | P1 | 15-20% | 中 |
-| 推理感知调度 | 调度 | P1 | 10-15% | 中 |
-| Prefix Caching | 内存 | P1 | 20-30% | 中 |
+| 启用 FP8 KV Cache | 内存 | P0 | 15-25% 内存节省 | 低 |
+| 启用 EAGLE3 推测解码 | 调度 | P0 | 20-40% 吞吐 | 低 |
+| 推理感知调度 | 调度 | P0 | 10-15% | 低 |
+| MoE 专家 FP8 量化 | 量化 | P1 | 20-30% 内存节省 | 中 |
+| Prefix Caching 增强 | 内存 | P1 | 20-30% (重复请求) | 中 |
+| GQA 专用 Kernel 调优 | 计算 | P1 | 5-10% | 中 |
 | 工具调用优化 | 其他 | P2 | 2-3% | 低 |
-| M2 专用量化 | 量化 | P2 | 15-25% | 高 |
-| 推测解码 | 调度 | P2 | 30-50% | 高 |
+| Expert Parallelism | 并行 | P2 | 取决于规模 | 高 |
+| 高级量化 (AWQ) | 量化 | P2 | 30-50% 内存节省 | 高 |
 
 ### 关键结论
 
-1. **计算优化**：RoPE 和矩阵运算是主要瓶颈
-2. **内存优化**：KV Cache 布局和 workspace 管理有较大空间
-3. **调度优化**：M2 的长推理特性需要专门的调度策略
-4. **工具支持**：与 M2 团队合作申请专用 kernel 是长期最优解
+1. **计算优化**：GQA 相比 MHA 已经有优化，重点在 MoE 和 Attention Kernel 调优
+2. **内存优化**：KV Cache 和 MoE 专家权重是主要优化点，FP8 量化应该优先考虑
+3. **调度优化**：M2 的长推理特性需要专门的调度策略，特别是推理长度感知
+4. **推测解码**：利用已有的 EAGLE3 支持可能是性价比最高的优化
+5. **工具支持**：与 MiniMax 团队合作，了解模型特性，可以获得更好的优化效果
 
 ---
 
 **文档版本**: vLLM v0.21.0 + MiniMax-M2  
 **分析日期**: 2026年5月21日  
 **有效期**: 3个月（vLLM 快速迭代中）
+
+**修正说明**：此版本已修正之前关于 MLA 的错误，MiniMax-M2 使用的是 GQA + MoE 架构。
