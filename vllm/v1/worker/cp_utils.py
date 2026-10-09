@@ -134,13 +134,14 @@ def split_dcp_context_queries(
     seq_lens_cpu_upper_bound: torch.Tensor | None,
     max_query_len: int,
     num_actual_tokens: int,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     """Split reordered DCP context queries into decode and extend regions."""
     num_reqs = query_start_loc.shape[0] - 1
     if max_query_len <= 1:
-        return num_reqs, 0, num_actual_tokens, 0
+        return num_reqs, 0, num_actual_tokens, 0, 0
     if seq_lens_cpu_upper_bound is None:
-        return 0, num_reqs, 0, num_actual_tokens
+        all_query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        return 0, num_reqs, 0, num_actual_tokens, int(all_query_lens.max().item())
 
     common_attn_metadata = cast(
         CommonAttentionMetadata,
@@ -161,7 +162,22 @@ def split_dcp_context_queries(
         num_extend_tokens,
         _num_prefill_tokens,
     ) = split_decodes_prefills_and_extends(common_attn_metadata)
-    return num_decodes, num_extends, num_decode_tokens, num_extend_tokens
+
+    if num_extends > 0:
+        extend_query_lens = (
+            query_start_loc[num_decodes + 1 : num_decodes + num_extends + 1]
+            - query_start_loc[num_decodes : num_decodes + num_extends]
+        )
+        context_prefill_max_seqlen_q = int(extend_query_lens.max().item())
+    else:
+        context_prefill_max_seqlen_q = 0
+    return (
+        num_decodes,
+        num_extends,
+        num_decode_tokens,
+        num_extend_tokens,
+        context_prefill_max_seqlen_q,
+    )
 
 
 def should_split_fa2_dcp_context_attention(
@@ -192,7 +208,6 @@ def run_split_fa2_dcp_context_attention(
     value_cache: torch.Tensor,
     dcp_context_out: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int,
     dcp_context_kv_lens: torch.Tensor,
     max_dcp_context_kv_len: int,
     softmax_scale: float,
@@ -211,6 +226,7 @@ def run_split_fa2_dcp_context_attention(
     num_context_prefill_reqs: int,
     num_decode_tokens: int,
     num_context_prefill_tokens: int,
+    context_prefill_max_seqlen_q: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dcp_context_out.zero_()
     context_lse = torch.full(
@@ -264,7 +280,7 @@ def run_split_fa2_dcp_context_attention(
             v=value_cache,
             out=dcp_context_out[prefill_start:prefill_end],
             cu_seqlens_q=prefill_query_start_loc,
-            max_seqlen_q=max_seqlen_q,
+            max_seqlen_q=context_prefill_max_seqlen_q,
             seqused_k=dcp_context_kv_lens[prefill_req_slice],
             max_seqlen_k=max_dcp_context_kv_len,
             softmax_scale=softmax_scale,

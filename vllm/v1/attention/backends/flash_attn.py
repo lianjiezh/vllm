@@ -542,6 +542,7 @@ class FlashAttentionMetadata:
     num_prefill_reqs: int = 0
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
+    context_prefill_max_seqlen_q: int = 0
 
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
@@ -875,6 +876,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         num_prefill_reqs = 0
         num_decode_tokens = 0
         num_prefill_tokens = 0
+        context_prefill_max_seqlen_q = 0
 
         cu_prefix_query_lens = None
         prefix_kv_lens = None
@@ -914,6 +916,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     num_prefill_reqs,
                     num_decode_tokens,
                     num_prefill_tokens,
+                    context_prefill_max_seqlen_q,
                 ) = split_dcp_context_queries(
                     common_attn_metadata.query_start_loc_cpu,
                     common_attn_metadata.seq_lens_cpu_upper_bound,
@@ -1007,6 +1010,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             num_prefill_reqs=num_prefill_reqs,
             num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            context_prefill_max_seqlen_q=context_prefill_max_seqlen_q,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             scheduler_metadata=scheduler_metadata,
@@ -1636,7 +1640,6 @@ class FlashAttentionImpl(AttentionImpl):
                 value_cache,
                 dcp_context_out,
                 cu_seqlens_q,
-                max_seqlen_q,
                 attn_metadata.dcp_context_kv_lens,
                 attn_metadata.max_dcp_context_kv_len,
                 self.scale,
@@ -1655,6 +1658,7 @@ class FlashAttentionImpl(AttentionImpl):
                 num_context_prefills,
                 num_decode_tokens,
                 num_context_prefill_tokens,
+                context_prefill_max_seqlen_q=attn_metadata.context_prefill_max_seqlen_q,
             )
         else:
             context_attn_out, context_lse = flash_attn_varlen_func(
